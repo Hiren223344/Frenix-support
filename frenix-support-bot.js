@@ -37,13 +37,18 @@ const auth = () => (API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {});
 
 function must(k) {
   const v = process.env[k];
-  if (!v) { console.error(`Missing ${k}. Set it in .env next to this file.`); process.exit(1); }
+  if (!v) {
+    if (process.argv.includes("--selftest")) return ""; // no bot startup in this mode, no token needed
+    console.error(`Missing ${k}. Set it in .env next to this file.`);
+    process.exit(1);
+  }
   return v;
 }
 
 const TG_TOKEN = must("TELEGRAM_TOKEN");
 const API_KEY  = process.env.FRENIX_API_KEY || ""; // optional: a direct vLLM host may not need one
-const API_BASE = process.env.FRENIX_BASE_URL || "https://newapi.frenix.sh/v1";
+const API_BASE = process.env.FRENIX_BASE_URL || "https://newapi.frenix.sh/v1"; // where WE send requests
+const PUBLIC_BASE = process.env.FRENIX_PUBLIC_BASE || "https://newapi.frenix.sh/v1"; // what we tell USERS to use
 const MODEL    = process.env.FRENIX_MODEL    || "gemma-4-31b";
 const USERNAME = (process.env.BOT_USERNAME || "").replace(/^@/, "");
 
@@ -86,7 +91,7 @@ WHAT FRENIX IS
   Anthropic, Google, DeepSeek, Qwen and others.
 - Dynamic routing across providers, sub-40ms gateway overhead, zero retention: prompts and
   completions are never stored or used for training.
-- OpenAI-compatible API. Base URL: ${API_BASE}
+- OpenAI-compatible API. Base URL: ${PUBLIC_BASE}
   Endpoints: /chat/completions, /models, /embeddings. Auth header: Authorization: Bearer <key>.
 - Keys are made in the dashboard and shown once. Rotate immediately if one leaks.
 - Tiers: Basic, Pro, Ultra — each unlocks more models and higher rate limits, applied per key.
@@ -728,8 +733,9 @@ async function runTool(name, argsJson, isAdmin) {
 /* ================================================================== */
 
 /* Gemma 4 has a thinking mode. Reasoning arrives either as a separate
-   reasoning_content delta or wrapped in <think> tags inside content —
-   drop both without breaking mid-tag across chunk boundaries. */
+   reasoning_content delta, wrapped in <think> tags inside content, or —
+   from upstream Harmony-style models — marked with <|channel>NAME<channel|>
+   segments. Drop all of it without breaking mid-tag across chunk boundaries. */
 function heldTagPrefix(s, tag) {
   for (let n = Math.min(tag.length - 1, s.length); n > 0; n--) {
     if (s.slice(-n) === tag.slice(0, n)) return s.slice(-n);
@@ -737,29 +743,73 @@ function heldTagPrefix(s, tag) {
   return "";
 }
 
+const OPEN_THINK = "<think>";
+const CLOSE_THINK = "</think>";
+const OPEN_CHANNEL = "<|channel>";
+const CLOSE_CHANNEL = "<channel|>";
+
 function makeThinkFilter() {
-  let inside = false;
+  let mode = "text"; // "text" | "think" | "channelName"
+  let channel = null; // last channel name seen; null = no channel markers yet (passthrough)
+  let nameBuf = "";
   let held = "";
+
+  const suppressed = () => channel !== null && channel.trim().toLowerCase() !== "final";
+
   return (delta) => {
     let s = held + delta;
     held = "";
     let out = "";
     while (s) {
-      if (inside) {
-        const end = s.indexOf("</think>");
-        if (end === -1) { held = heldTagPrefix(s, "</think>"); break; }
-        s = s.slice(end + 8);
-        inside = false;
-      } else {
-        const start = s.indexOf("<think>");
-        if (start === -1) {
-          held = heldTagPrefix(s, "<think>");
-          out += s.slice(0, s.length - held.length);
+      if (mode === "think") {
+        const end = s.indexOf(CLOSE_THINK);
+        if (end === -1) { held = heldTagPrefix(s, CLOSE_THINK); break; }
+        s = s.slice(end + CLOSE_THINK.length);
+        mode = "text";
+        continue;
+      }
+
+      if (mode === "channelName") {
+        const end = s.indexOf(CLOSE_CHANNEL);
+        if (end === -1) {
+          held = heldTagPrefix(s, CLOSE_CHANNEL);
+          nameBuf += s.slice(0, s.length - held.length);
           break;
         }
-        out += s.slice(0, start);
-        s = s.slice(start + 7);
-        inside = true;
+        nameBuf += s.slice(0, end);
+        channel = nameBuf;
+        nameBuf = "";
+        s = s.slice(end + CLOSE_CHANNEL.length);
+        mode = "text";
+        continue;
+      }
+
+      // mode === "text"
+      const thinkAt = s.indexOf(OPEN_THINK);
+      const channelAt = s.indexOf(OPEN_CHANNEL);
+      let idx = -1, which = null;
+      if (thinkAt !== -1 && (channelAt === -1 || thinkAt < channelAt)) { idx = thinkAt; which = "think"; }
+      else if (channelAt !== -1) { idx = channelAt; which = "channel"; }
+
+      if (idx === -1) {
+        const heldThink = heldTagPrefix(s, OPEN_THINK);
+        const heldChannel = heldTagPrefix(s, OPEN_CHANNEL);
+        held = heldThink.length >= heldChannel.length ? heldThink : heldChannel;
+        const emit = s.slice(0, s.length - held.length);
+        if (!suppressed()) out += emit;
+        break;
+      }
+
+      const emit = s.slice(0, idx);
+      if (!suppressed()) out += emit;
+
+      if (which === "think") {
+        s = s.slice(idx + OPEN_THINK.length);
+        mode = "think";
+      } else {
+        s = s.slice(idx + OPEN_CHANNEL.length);
+        mode = "channelName";
+        nameBuf = "";
       }
     }
     return out;
@@ -1170,7 +1220,8 @@ async function main() {
   const me = await tg("getMe", {});
   if (!me) { console.error("Bad TELEGRAM_TOKEN."); process.exit(1); }
   console.log(`Frenix Support up as @${me.username}`);
-  console.log(`  gateway ${API_BASE}`);
+  console.log(`  gateway (internal) ${API_BASE}`);
+  console.log(`  gateway (public, told to users) ${PUBLIC_BASE}`);
   console.log(`  model ${MODEL} (text + vision)`);
   console.log(`  handoff -> ${SUPPORT_CHAT}${ADMIN_TOKEN ? " · admin tools on" : " · no admin token"}`);
   console.log(`  search ${EXA_KEY ? "exa" : TAVILY_KEY ? "tavily" : SEARXNG_URL ? "searxng" : "off"}`);
@@ -1191,7 +1242,78 @@ async function main() {
   }
 }
 
+/* ================================================================== */
+/* selftest — node frenix-support-bot.js --selftest                   */
+/* ================================================================== */
+
+function runSelfTest() {
+  const cases = [
+    {
+      name: "clean text, no markers",
+      chunks: ["Hello, ", "how are ", "you?"],
+      expected: "Hello, how are you?",
+    },
+    {
+      name: "<think> block delivered whole",
+      chunks: ["A", "<think>B</think>", "C"],
+      expected: "AC",
+    },
+    {
+      name: "<think> open tag split mid-marker across two chunks",
+      chunks: ["A<thi", "nk>B</think>C"],
+      expected: "AC",
+    },
+    {
+      name: "<think> never closes — suppress to end of stream",
+      chunks: ["before ", "<think>never closes ", "more reasoning"],
+      expected: "before ",
+    },
+    {
+      name: "channel marker split across two chunks (thought, then final)",
+      chunks: [
+        "Hi! <|chan",
+        "nel>thought<channel|>SECRET ",
+        "reasoning<|channel>final<channel|>",
+        "ANSWER",
+      ],
+      expected: "Hi! ANSWER",
+    },
+    {
+      name: "channel open marker spanning three chunks",
+      chunks: ["Start ", "<|chan", "nel>final<chan", "nel|>End"],
+      expected: "Start End",
+    },
+    {
+      name: "channel marker never switches to final — suppress to end of stream",
+      chunks: ["Before ", "<|channel>analysis<channel|>", "hidden stuff", " more hidden, never closes"],
+      expected: "Before ",
+    },
+  ];
+
+  let failed = 0;
+  for (const { name, chunks, expected } of cases) {
+    const clean = makeThinkFilter();
+    let got = "";
+    for (const c of chunks) got += clean(c);
+    if (got === expected) {
+      console.log(`ok   - ${name}`);
+    } else {
+      failed++;
+      console.error(`FAIL - ${name}`);
+      console.error(`  expected: ${JSON.stringify(expected)}`);
+      console.error(`  got:      ${JSON.stringify(got)}`);
+    }
+  }
+
+  console.log(`${cases.length - failed}/${cases.length} passed`);
+  return failed === 0;
+}
+
 process.on("SIGINT", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 
-main();
+if (process.argv.includes("--selftest")) {
+  process.exit(runSelfTest() ? 0 : 1);
+} else {
+  main();
+}
