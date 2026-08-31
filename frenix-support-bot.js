@@ -897,11 +897,14 @@ async function* converse(messages, isAdmin) {
     const { calls, finishReason, hadText } = yield* streamOnce(work, isAdmin);
 
     if (!calls.length) {
-      // model ran out of tokens while still reasoning and never reached its
-      // actual answer — give it one nudge to skip ahead, instead of failing outright
-      if (!hadText && finishReason === "length" && !nudgedToAnswer) {
+      // no tool call and zero visible text this round — whether that's max_tokens
+      // cutting reasoning off (finish_reason "length") or the model just stopping
+      // after reasoning without ever producing an answer (finish_reason "stop" or
+      // anything else), there's no legitimate reason for a round to end this way.
+      // Give it one nudge to skip ahead, instead of failing outright.
+      if (!hadText && !nudgedToAnswer) {
         nudgedToAnswer = true;
-        console.log("round ended mid-reasoning (finish_reason=length, no visible text) — nudging for a direct answer");
+        console.log(`round ended with no visible text (finish_reason=${finishReason}) — nudging for a direct answer`);
         work.push({ role: "user", content: "Stop reasoning and answer in one short line now." });
         round--;
         continue;
