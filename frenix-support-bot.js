@@ -47,8 +47,12 @@ function must(k) {
 
 const TG_TOKEN = must("TELEGRAM_TOKEN");
 const API_KEY  = process.env.FRENIX_API_KEY || ""; // optional: a direct vLLM host may not need one
-const API_BASE = process.env.FRENIX_BASE_URL || "https://newapi.frenix.sh/v1"; // where WE send requests
-const PUBLIC_BASE = process.env.FRENIX_PUBLIC_BASE || "https://newapi.frenix.sh/v1"; // what we tell USERS to use
+// API_BASE: the bot's own self-hosted inference model (its "brain" — streamOnce only).
+// PUBLIC_BASE: the real Frenix gateway — what users are told to use, and what every
+// diagnostic/test tool (list_models, test_model, gateway_health, /diag) actually checks,
+// since that's the product they're asking about.
+const API_BASE = process.env.FRENIX_BASE_URL || "https://newapi.frenix.sh/v1";
+const PUBLIC_BASE = process.env.FRENIX_PUBLIC_BASE || "https://newapi.frenix.sh/v1";
 const MODEL    = process.env.FRENIX_MODEL    || "gemma-4-31b";
 const USERNAME = (process.env.BOT_USERNAME || "").replace(/^@/, "");
 
@@ -424,7 +428,7 @@ async function probeSpeed(id) {
   const t0 = Date.now();
   let ttft = null, text = "", usage = null;
 
-  const res = await fetch(`${API_BASE}/chat/completions`, {
+  const res = await fetch(`${PUBLIC_BASE}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...auth() },
     body: JSON.stringify({
@@ -473,7 +477,7 @@ async function probeSpeed(id) {
 
 async function probeTools(id) {
   try {
-    const res = await fetch(`${API_BASE}/chat/completions`, {
+    const res = await fetch(`${PUBLIC_BASE}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...auth() },
       body: JSON.stringify({
@@ -501,7 +505,7 @@ async function probeTools(id) {
 
 async function probeVision(id) {
   try {
-    const res = await fetch(`${API_BASE}/chat/completions`, {
+    const res = await fetch(`${PUBLIC_BASE}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...auth() },
       body: JSON.stringify({
@@ -629,7 +633,7 @@ let modelCache = { at: 0, ids: [] };
 
 async function fetchModels() {
   if (Date.now() - modelCache.at < 5 * 60e3) return modelCache.ids;
-  const res = await fetch(`${API_BASE}/models`, { headers: auth() });
+  const res = await fetch(`${PUBLIC_BASE}/models`, { headers: auth() });
   if (!res.ok) throw new Error(`/models returned ${res.status}`);
   const body = await res.json();
   const ids = (body?.data || []).map((m) => m.id).filter(Boolean).sort();
@@ -906,7 +910,7 @@ async function diagnose() {
   for (const [label, path] of [["/models", "/models"]]) {
     const t0 = Date.now();
     try {
-      const res = await fetch(API_BASE + path, { headers: auth() });
+      const res = await fetch(PUBLIC_BASE + path, { headers: auth() });
       const ms = Date.now() - t0;
       const body = await res.json().catch(() => ({}));
       const count = Array.isArray(body?.data) ? body.data.length : "?";
@@ -917,7 +921,7 @@ async function diagnose() {
   }
   const t1 = Date.now();
   try {
-    const res = await fetch(`${API_BASE}/chat/completions`, {
+    const res = await fetch(`${PUBLIC_BASE}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...auth() },
       body: JSON.stringify({ model: MODEL, max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
@@ -927,7 +931,7 @@ async function diagnose() {
   } catch (e) {
     lines.push(`${MODEL} → failed (${e.message})`);
   }
-  return `Gateway check\n${API_BASE}\n\n${lines.join("\n")}`;
+  return `Gateway check\n${PUBLIC_BASE}\n\n${lines.join("\n")}`;
 }
 
 /* ================================================================== */
