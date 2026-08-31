@@ -820,8 +820,11 @@ function makeThinkFilter() {
   };
 }
 
-/* Streams one turn. Yields {t:"text"} pieces and returns any tool calls
-   the model asked for. */
+/* Streams one turn. Yields {t:"text"} pieces and returns any tool calls the
+   model asked for, plus finishReason/hadText so converse() can tell a round
+   that legitimately finished apart from one that got cut off mid-reasoning
+   (all its content stuck in a channel/think block that never closed because
+   max_tokens ran out before the model reached its actual answer). */
 async function* streamOnce(messages, isAdmin) {
   const res = await fetch(`${API_BASE}/chat/completions`, {
     method: "POST",
@@ -840,6 +843,8 @@ async function* streamOnce(messages, isAdmin) {
   const clean = makeThinkFilter();
   const calls = [];
   let buf = "";
+  let hadText = false;
+  let finishReason = null;
 
   for await (const part of res.body) {
     buf += Buffer.from(part).toString("utf8");
@@ -848,9 +853,11 @@ async function* streamOnce(messages, isAdmin) {
     for (const line of lines) {
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") return calls.filter(Boolean);
+      if (payload === "[DONE]") return { calls: calls.filter(Boolean), finishReason, hadText };
       try {
-        const delta = JSON.parse(payload).choices?.[0]?.delta;
+        const choice = JSON.parse(payload).choices?.[0];
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+        const delta = choice?.delta;
         if (!delta) continue;
 
         for (const tc of delta.tool_calls || []) {
@@ -863,11 +870,11 @@ async function* streamOnce(messages, isAdmin) {
 
         if (delta.reasoning_content) continue; // reasoning stream, not the answer
         const text = clean(delta.content || "");
-        if (text) yield { t: "text", v: text };
+        if (text) { hadText = true; yield { t: "text", v: text }; }
       } catch {}
     }
   }
-  return calls.filter(Boolean);
+  return { calls: calls.filter(Boolean), finishReason, hadText };
 }
 
 const TOOL_LABEL = {
@@ -884,10 +891,23 @@ const TOOL_LABEL = {
 /* Full turn: stream, run any tools, stream again. Yields text and status pieces. */
 async function* converse(messages, isAdmin) {
   const work = [...messages];
+  let nudgedToAnswer = false;
 
   for (let round = 0; round <= TOOL_ROUNDS; round++) {
-    const calls = yield* streamOnce(work, isAdmin);
-    if (!calls.length) return;
+    const { calls, finishReason, hadText } = yield* streamOnce(work, isAdmin);
+
+    if (!calls.length) {
+      // model ran out of tokens while still reasoning and never reached its
+      // actual answer — give it one nudge to skip ahead, instead of failing outright
+      if (!hadText && finishReason === "length" && !nudgedToAnswer) {
+        nudgedToAnswer = true;
+        console.log("round ended mid-reasoning (finish_reason=length, no visible text) — nudging for a direct answer");
+        work.push({ role: "user", content: "Stop reasoning and answer in one short line now." });
+        round--;
+        continue;
+      }
+      return;
+    }
 
     if (round === TOOL_ROUNDS) {
       work.push({ role: "user", content: "Stop calling tools and answer with what you have." });
