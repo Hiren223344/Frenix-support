@@ -1195,6 +1195,14 @@ async function handle(msg, extraImages = []) {
     for (const extra of parts.slice(1)) await sendHtml(chatId, toHtml(extra));
   } catch (err) {
     console.error("reply failed:", err.message);
+    // keep the user's message in context even though the reply failed — otherwise
+    // a failed turn vanishes from history and the bot looks like it forgot what
+    // was just asked the moment the user follows up
+    s.history.push(userMsg, {
+      role: "assistant",
+      content: "(a technical error interrupted this reply — if the user follows up on it, just answer their original question, don't ask them to repeat it)",
+    });
+    if (s.history.length > MAX_TURNS) s.history = s.history.slice(-MAX_TURNS);
     await editPlain(
       chatId,
       holder.message_id,
