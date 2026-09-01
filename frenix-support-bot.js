@@ -19,7 +19,7 @@
  * ------------------------------------------------------------------
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 
 /* ================================================================== */
 /* config                                                             */
@@ -1211,6 +1211,14 @@ async function renderTicketCard(t) {
   );
 }
 
+// running log of everything said in a ticket, so closing it doesn't lose the conversation to
+// a scroll of separate relayed messages — capped so one runaway ticket can't grow unbounded
+function logTicket(t, from, text, by) {
+  t.transcript = t.transcript || [];
+  t.transcript.push({ from, text: String(text || "").slice(0, 500), by, at: Date.now() });
+  if (t.transcript.length > 200) t.transcript = t.transcript.slice(-200);
+}
+
 // forward a follow-up message from a user with an open ticket straight into that ticket's
 // thread in SUPPORT_CHAT — copyMessage handles text/photo/document/etc. uniformly, so every
 // message gets through, not just the one snapshot taken when the ticket was first opened
@@ -1222,6 +1230,37 @@ async function relayToTicket(t, msg) {
     reply_to_message_id: t.cardMsgId,
   }).catch(() => null);
   if (copied?.message_id) cardIndex.set(copied.message_id, t.id);
+  logTicket(t, "user", msg.text || msg.caption || "[attachment]");
+  saveState();
+}
+
+const TRANSCRIPTS_FILE = new URL("./transcripts.log", import.meta.url);
+
+function ticketTranscriptText(t) {
+  const lines = [
+    `Ticket #${t.id} closed by ${t.closedBy}`,
+    `Requester: ${t.who}`,
+    `Opened ${new Date(t.createdAt).toISOString()} · Closed ${new Date(t.closedAt).toISOString()}`,
+    "",
+  ];
+  for (const e of t.transcript || []) {
+    const time = new Date(e.at).toISOString().slice(11, 16);
+    lines.push(`[${time} ${e.from}${e.by ? " · " + e.by : ""}] ${e.text}`);
+  }
+  if (!(t.transcript || []).length) lines.push("(nothing was said before this ticket closed)");
+  return lines.join("\n");
+}
+
+// send the closed ticket's full conversation to SUPPORT_CHAT and append it to a local log file,
+// so it's a durable, readable record instead of just disappearing once the ticket gets pruned
+async function finalizeTicketClose(t) {
+  const transcript = ticketTranscriptText(t);
+  await sendPlain(SUPPORT_CHAT, transcript.slice(0, 4000)).catch(() => {});
+  try {
+    appendFileSync(TRANSCRIPTS_FILE, transcript + "\n\n" + "=".repeat(40) + "\n\n");
+  } catch (e) {
+    console.error("transcript save:", e.message);
+  }
 }
 
 async function handoff(msg, note) {
@@ -1260,7 +1299,9 @@ async function handoff(msg, note) {
     closedBy: null,
     createdAt: Date.now(),
     closedAt: 0,
+    transcript: [],
   };
+  if (note) logTicket(t, "user", note);
 
   const card_msg = await tg("sendMessage", {
     chat_id: SUPPORT_CHAT,
@@ -1297,17 +1338,21 @@ async function staff(msg) {
     chatTickets.delete(target);
     await sendPlain(target, "Handoff closed — I'm back if you need anything else.");
     await renderTicketCard(t);
+    await finalizeTicketClose(t);
     saveState();
     return sendPlain(SUPPORT_CHAT, "Closed.", msg.message_id);
   }
 
   if (msg.photo?.length) {
     await tg("copyMessage", { chat_id: target, from_chat_id: SUPPORT_CHAT, message_id: msg.message_id });
+    logTicket(t, "staff", "[photo]", who(msg));
   } else if (text) {
     await sendPlain(target, `From the Frenix team:\n\n${text}`);
+    logTicket(t, "staff", text, who(msg));
   } else return;
 
   state(target).humanUntil = Date.now() + HUMAN_MS;
+  saveState();
   return sendPlain(SUPPORT_CHAT, "Sent.", msg.message_id);
 }
 
@@ -1362,6 +1407,7 @@ async function routeCallback(cb) {
     chatTickets.delete(t.chatId);
     await sendPlain(t.chatId, "Handoff closed — I'm back if you need anything else.").catch(() => {});
     await renderTicketCard(t);
+    await finalizeTicketClose(t);
     saveState();
     return ack(cb.id, "Closed.");
   }
