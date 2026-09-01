@@ -85,6 +85,7 @@ const HUMAN_MS   = 45 * 60e3;       // bot stays quiet this long after a handoff
 const TOOL_ROUNDS = 3;              // max tool-calling loops per question
 const HEALTH_CHECK_MS   = 5 * 60e3; // how often to poll the public gateway in the background
 const HEALTH_FAIL_LIMIT = 3;        // consecutive failures before alerting SUPPORT_CHAT
+const SPIN_FRAMES = ["✦", "✧", "✶", "✷"]; // plain star glyphs, not emoji — cycled on the "thinking" placeholder
 
 /* ================================================================== */
 /* what the bot knows — edit this block, nothing else                 */
@@ -1274,8 +1275,19 @@ async function handle(msg, extraImages = []) {
   const beat = setInterval(() => typing(chatId).catch(() => {}), 4500);
   typing(chatId).catch(() => {});
 
-  const note = allImages.length ? `Reading ${allImages.length > 1 ? "the screenshots" : "the screenshot"}…` : "…";
-  const holder = await sendPlain(chatId, note, isGroup ? msg.message_id : undefined);
+  const note = allImages.length ? `Reading ${allImages.length > 1 ? "the screenshots" : "the screenshot"}` : "Thinking";
+  const holder = await sendPlain(chatId, `${note} ${SPIN_FRAMES[0]}`, isGroup ? msg.message_id : undefined);
+
+  // animate the placeholder while the model hasn't produced a status or any
+  // visible text yet — this is the phase that can drag on, since it now also
+  // covers a round that's stuck reasoning before the nudge-and-retry kicks in
+  let placeholderActive = true;
+  let spinFrame = 0;
+  const spin = setInterval(() => {
+    if (!placeholderActive) return;
+    spinFrame = (spinFrame + 1) % SPIN_FRAMES.length;
+    editPlain(chatId, holder.message_id, `${note} ${SPIN_FRAMES[spinFrame]}`).catch(() => {});
+  }, EDIT_MS);
 
   stripOldImages(s.history);
   const userMsg = { role: "user", content: buildContent(prompt, allImages) };
@@ -1286,9 +1298,10 @@ async function handle(msg, extraImages = []) {
   try {
     for await (const piece of converse([...s.history, userMsg], isAdmin(msg))) {
       if (piece.t === "status") {
-        if (!acc) { editPlain(chatId, holder.message_id, piece.v).catch(() => {}); lastEdit = Date.now(); }
+        if (!acc) { placeholderActive = false; editPlain(chatId, holder.message_id, piece.v).catch(() => {}); lastEdit = Date.now(); }
         continue;
       }
+      placeholderActive = false;
       acc += piece.v;
       const now = Date.now();
       if (now - lastEdit > EDIT_MS && acc.length < TG_LIMIT) {
@@ -1321,6 +1334,7 @@ async function handle(msg, extraImages = []) {
     ).catch(() => {});
   } finally {
     clearInterval(beat);
+    clearInterval(spin);
     s.busy = false;
   }
 }
