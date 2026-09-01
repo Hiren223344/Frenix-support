@@ -1052,15 +1052,22 @@ function state(id) {
   return s;
 }
 
+const TICKET_RETENTION_MS = 7 * 24 * 60 * 60e3; // how long a closed ticket stays around after closing
+
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of chats) if (now - s.seen > IDLE_MS) chats.delete(id);
-  while (tickets.size > 500) tickets.delete(tickets.keys().next().value);
+  for (const [id, t] of tickets) {
+    if (t.status === "closed" && now - (t.closedAt || t.createdAt) > TICKET_RETENTION_MS) {
+      tickets.delete(id);
+      cardIndex.delete(t.cardMsgId);
+    }
+  }
   saveState();
 }, 10 * 60e3).unref();
 
 // chats/tickets are just in-memory Maps — persist them to a plain JSON file
-// next to the script so a restart doesn't wipe every thread and open handoff.
+// next to the script so a restart doesn't wipe every thread and open ticket.
 const STATE_FILE = new URL("./state.json", import.meta.url);
 
 function loadState() {
@@ -1071,14 +1078,22 @@ function loadState() {
       if (now - s.seen > IDLE_MS) continue; // already idle-expired, don't resurrect it
       chats.set(id, { ...s, busy: false }); // never restore mid-request as busy
     }
-    for (const [id, chatId] of data.tickets || []) tickets.set(id, chatId);
-    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} open ticket(s)`);
+    for (const [id, t] of data.tickets || []) {
+      if (!t || typeof t !== "object" || !t.status) continue; // skip pre-ticket-system entries
+      tickets.set(id, t);
+      if (t.cardMsgId) cardIndex.set(t.cardMsgId, id);
+    }
+    if (typeof data.nextTicketId === "number") nextTicketId = Math.max(nextTicketId, data.nextTicketId);
+    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} ticket(s)`);
   } catch {} // no state.json yet, or it's unreadable — start fresh
 }
 
 function saveState() {
   try {
-    writeFileSync(STATE_FILE, JSON.stringify({ chats: [...chats.entries()], tickets: [...tickets.entries()] }));
+    writeFileSync(
+      STATE_FILE,
+      JSON.stringify({ chats: [...chats.entries()], tickets: [...tickets.entries()], nextTicketId })
+    );
   } catch (e) {
     console.error("saveState:", e.message);
   }
@@ -1147,14 +1162,44 @@ function buildContent(text, images) {
 /* ================================================================== */
 
 const isAdmin = (msg) => String(msg.from?.id) === String(ADMIN_ID);
+// staff = anyone who can see SUPPORT_CHAT — the trust boundary for claiming/closing tickets
+const isStaff = (msg) => isAdmin(msg) || (SUPPORT_CHAT && String(msg.chat.id) === String(SUPPORT_CHAT));
 
-// message_id of a card in the support chat -> the user chat it came from
+// ticket id -> { id, chatId, status, who, note, recent, cardMsgId, claimedBy, closedBy, createdAt, closedAt }
 const tickets = new Map();
+// message_id of a ticket card in the support chat -> ticket id, for fast lookup on staff replies
+const cardIndex = new Map();
+let nextTicketId = 1;
 
 function who(msg) {
   const u = msg.from || {};
   const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || "unknown";
   return u.username ? `${name} (@${u.username}, id ${u.id})` : `${name} (id ${u.id})`;
+}
+
+function ticketCardText(t) {
+  const status = t.status === "claimed" ? `claimed by ${t.claimedBy}` : t.status === "closed" ? `closed by ${t.closedBy}` : "open";
+  return (
+    `Ticket #${t.id} — ${status}\n\n${t.who}\nchat ${t.chatId}\n\n` +
+    (t.note ? `Says: ${t.note}\n\n` : "") +
+    (t.recent ? `Thread so far:\n${t.recent}\n\n` : "") +
+    (t.status === "closed" ? "Closed." : "Reply to this message and it goes straight to them.")
+  );
+}
+
+function ticketKeyboard(t) {
+  if (t.status === "open") return { inline_keyboard: [[{ text: "Claim", callback_data: `ticket:claim:${t.id}` }]] };
+  if (t.status === "claimed") return { inline_keyboard: [[{ text: "Close", callback_data: `ticket:close:${t.id}` }]] };
+  return { inline_keyboard: [] };
+}
+
+async function renderTicketCard(t) {
+  await tg("editMessageText", {
+    chat_id: SUPPORT_CHAT,
+    message_id: t.cardMsgId,
+    text: ticketCardText(t).slice(0, 4000),
+    reply_markup: ticketKeyboard(t),
+  }).catch(() => {});
 }
 
 async function handoff(msg, note) {
@@ -1174,18 +1219,33 @@ async function handoff(msg, note) {
     })
     .join("\n\n");
 
-  const card =
-    `Handoff requested\n\n${who(msg)}\nchat ${chatId}\n\n` +
-    (note ? `Says: ${note}\n\n` : "") +
-    (recent ? `Thread so far:\n${recent}\n\n` : "") +
-    `Reply to this message and it goes straight to them. /close ends the handoff.`;
+  const t = {
+    id: nextTicketId++,
+    chatId,
+    status: "open",
+    who: who(msg),
+    note: note || "",
+    recent,
+    cardMsgId: 0,
+    claimedBy: null,
+    closedBy: null,
+    createdAt: Date.now(),
+    closedAt: 0,
+  };
 
-  const card_msg = await sendPlain(SUPPORT_CHAT, card.slice(0, 4000));
+  const card_msg = await tg("sendMessage", {
+    chat_id: SUPPORT_CHAT,
+    text: ticketCardText(t).slice(0, 4000),
+    reply_markup: ticketKeyboard(t),
+  });
   if (!card_msg) return sendPlain(chatId, "Couldn't reach the team just now. Email support@frenix.sh.");
 
-  tickets.set(card_msg.message_id, chatId);
+  t.cardMsgId = card_msg.message_id;
+  tickets.set(t.id, t);
+  cardIndex.set(t.cardMsgId, t.id);
   s.humanUntil = Date.now() + HUMAN_MS;
-  return sendPlain(chatId, "Passed to a person. I'll stay out of the way until they've replied — /bot brings me back.");
+  saveState();
+  return sendPlain(chatId, `Passed to a person (ticket #${t.id}). I'll stay out of the way until they've replied — /bot brings me back.`);
 }
 
 /* Messages arriving in the support chat: staff replies, not questions for the AI. */
@@ -1193,13 +1253,19 @@ async function staff(msg) {
   const text = (msg.text || msg.caption || "").trim();
   const parent = msg.reply_to_message;
 
-  const target = tickets.get(parent.message_id) || Number((parent.text || "").match(/^chat (-?\d+)$/m)?.[1]);
-  if (!target) return handle(msg); // replying to something that isn't a ticket — treat as a normal question
+  const ticketId = cardIndex.get(parent.message_id) ?? Number((parent.text || "").match(/^Ticket #(\d+)/)?.[1]);
+  const t = ticketId != null && !Number.isNaN(ticketId) ? tickets.get(ticketId) : null;
+  if (!t) return handle(msg); // replying to something that isn't a ticket card — treat as a normal question
+  const target = t.chatId;
 
   if (/^\/close\b/.test(text)) {
-    const s = state(target);
-    s.humanUntil = 0;
+    t.status = "closed";
+    t.closedBy = who(msg);
+    t.closedAt = Date.now();
+    state(target).humanUntil = 0;
     await sendPlain(target, "Handoff closed — I'm back if you need anything else.");
+    await renderTicketCard(t);
+    saveState();
     return sendPlain(SUPPORT_CHAT, "Closed.", msg.message_id);
   }
 
@@ -1211,6 +1277,48 @@ async function staff(msg) {
 
   state(target).humanUntil = Date.now() + HUMAN_MS;
   return sendPlain(SUPPORT_CHAT, "Sent.", msg.message_id);
+}
+
+const ack = (id, text, alert) => tg("answerCallbackQuery", { callback_query_id: id, text, show_alert: !!alert }).catch(() => {});
+
+/* Taps on a ticket card's Claim/Close button, or a ticket's row in /tickets. */
+async function routeCallback(cb) {
+  const m = (cb.data || "").match(/^ticket:(claim|close|info):(\d+)$/);
+  if (!m) return ack(cb.id);
+
+  const [, action, idStr] = m;
+  const t = tickets.get(Number(idStr));
+  if (!t) return ack(cb.id, "That ticket is gone.", true);
+
+  // only people who can see SUPPORT_CHAT get to act on tickets
+  if (!(SUPPORT_CHAT && String(cb.message?.chat?.id) === String(SUPPORT_CHAT))) return ack(cb.id, "Not available here.", true);
+
+  const actor = who({ from: cb.from });
+
+  if (action === "info") {
+    return ack(cb.id, ticketCardText(t).slice(0, 200), true);
+  }
+
+  if (action === "claim") {
+    if (t.status !== "open") return ack(cb.id, `Already ${t.status}.`, true);
+    t.status = "claimed";
+    t.claimedBy = actor;
+    await renderTicketCard(t);
+    saveState();
+    return ack(cb.id, "Claimed.");
+  }
+
+  if (action === "close") {
+    if (t.status === "closed") return ack(cb.id, "Already closed.", true);
+    t.status = "closed";
+    t.closedBy = actor;
+    t.closedAt = Date.now();
+    state(t.chatId).humanUntil = 0;
+    await sendPlain(t.chatId, "Handoff closed — I'm back if you need anything else.").catch(() => {});
+    await renderTicketCard(t);
+    saveState();
+    return ack(cb.id, "Closed.");
+  }
 }
 
 /* ================================================================== */
@@ -1254,6 +1362,20 @@ async function handle(msg, extraImages = []) {
   if (/^\/diag\b/.test(raw)) {
     typing(chatId).catch(() => {});
     return sendHtml(chatId, toHtml("```\n" + (await diagnose()) + "\n```"));
+  }
+  if (/^\/tickets\b/.test(raw)) {
+    if (!isStaff(msg)) return; // not staff-facing, say nothing
+    const open = [...tickets.values()].filter((t) => t.status !== "closed").sort((a, b) => a.id - b.id);
+    if (!open.length) return sendPlain(chatId, "No open tickets.");
+    const keyboard = open.slice(0, 30).map((t) => [{
+      text: `#${t.id} · ${t.status} · ${t.who.split(" (")[0].slice(0, 24)}`,
+      callback_data: `ticket:info:${t.id}`,
+    }]);
+    return tg("sendMessage", {
+      chat_id: chatId,
+      text: `Open tickets (${open.length}) — tap one for a quick look:`,
+      reply_markup: { inline_keyboard: keyboard },
+    });
   }
 
   // a person is on this thread — don't talk over them
@@ -1377,10 +1499,11 @@ async function main() {
   let offset = 0;
   for (;;) {
     try {
-      const updates = await tg("getUpdates", { offset, timeout: 30, allowed_updates: ["message"] });
+      const updates = await tg("getUpdates", { offset, timeout: 30, allowed_updates: ["message", "callback_query"] });
       for (const u of updates || []) {
         offset = u.update_id + 1;
         if (u.message) route(u.message);
+        else if (u.callback_query) routeCallback(u.callback_query).catch((e) => console.error("callback:", e.message));
       }
     } catch (e) {
       console.error("poll:", e.message);
