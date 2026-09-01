@@ -1,3 +1,4 @@
 .env
 state.json
+transcripts.log
 node_modules/
