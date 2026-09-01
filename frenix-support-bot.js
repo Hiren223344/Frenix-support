@@ -19,7 +19,7 @@
  * ------------------------------------------------------------------
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 /* ================================================================== */
 /* config                                                             */
@@ -83,6 +83,8 @@ const MAX_FILE   = 5 * 1024 * 1024; // 5MB cap on photos and logs
 const ALBUM_MS   = 1200;            // wait to gather a multi-photo album
 const HUMAN_MS   = 45 * 60e3;       // bot stays quiet this long after a handoff
 const TOOL_ROUNDS = 3;              // max tool-calling loops per question
+const HEALTH_CHECK_MS   = 5 * 60e3; // how often to poll the public gateway in the background
+const HEALTH_FAIL_LIMIT = 3;        // consecutive failures before alerting SUPPORT_CHAT
 
 /* ================================================================== */
 /* what the bot knows — edit this block, nothing else                 */
@@ -996,6 +998,47 @@ async function diagnose() {
   return `Gateway check\n${PUBLIC_BASE}\n\n${lines.join("\n")}`;
 }
 
+/* Background poll of the public gateway, independent of anyone asking /diag.
+   Cheap (just /models, no chat completion) and edge-triggered: alerts
+   SUPPORT_CHAT once after HEALTH_FAIL_LIMIT consecutive failures, and once
+   more on recovery — never on every single check. */
+let healthFails = 0;
+let healthAlerted = false;
+
+async function checkGatewayHealth() {
+  let ok = false;
+  let detail = "";
+  try {
+    const res = await fetch(`${PUBLIC_BASE}/models`, { headers: auth(), signal: AbortSignal.timeout(15000) });
+    ok = res.ok;
+    if (!ok) detail = `HTTP ${res.status}`;
+  } catch (e) {
+    detail = e.name === "TimeoutError" ? "timed out" : e.message;
+  }
+
+  if (ok) {
+    healthFails = 0;
+    if (healthAlerted) {
+      healthAlerted = false;
+      await sendPlain(SUPPORT_CHAT, "Frenix gateway is back up — /models is responding normally again.").catch(() => {});
+    }
+    return;
+  }
+
+  healthFails++;
+  if (healthFails >= HEALTH_FAIL_LIMIT && !healthAlerted) {
+    healthAlerted = true;
+    await sendPlain(
+      SUPPORT_CHAT,
+      `Frenix gateway may be down — /models has failed ${healthFails} checks in a row (${PUBLIC_BASE}): ${detail}`
+    ).catch(() => {});
+  }
+}
+
+function watchGatewayHealth() {
+  setInterval(() => checkGatewayHealth().catch((e) => console.error("health check:", e.message)), HEALTH_CHECK_MS).unref();
+}
+
 /* ================================================================== */
 /* per-chat state                                                     */
 /* ================================================================== */
@@ -1013,7 +1056,33 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, s] of chats) if (now - s.seen > IDLE_MS) chats.delete(id);
   while (tickets.size > 500) tickets.delete(tickets.keys().next().value);
+  saveState();
 }, 10 * 60e3).unref();
+
+// chats/tickets are just in-memory Maps — persist them to a plain JSON file
+// next to the script so a restart doesn't wipe every thread and open handoff.
+const STATE_FILE = new URL("./state.json", import.meta.url);
+
+function loadState() {
+  try {
+    const data = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    const now = Date.now();
+    for (const [id, s] of data.chats || []) {
+      if (now - s.seen > IDLE_MS) continue; // already idle-expired, don't resurrect it
+      chats.set(id, { ...s, busy: false }); // never restore mid-request as busy
+    }
+    for (const [id, chatId] of data.tickets || []) tickets.set(id, chatId);
+    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} open ticket(s)`);
+  } catch {} // no state.json yet, or it's unreadable — start fresh
+}
+
+function saveState() {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify({ chats: [...chats.entries()], tickets: [...tickets.entries()] }));
+  } catch (e) {
+    console.error("saveState:", e.message);
+  }
+}
 
 // images are heavy — keep only the newest one in context
 function stripOldImages(history) {
@@ -1291,6 +1360,8 @@ function route(msg) {
 /* ================================================================== */
 
 async function main() {
+  loadState();
+
   const me = await tg("getMe", {});
   if (!me) { console.error("Bad TELEGRAM_TOKEN."); process.exit(1); }
   console.log(`Frenix Support up as @${me.username}`);
@@ -1300,6 +1371,8 @@ async function main() {
   console.log(`  handoff -> ${SUPPORT_CHAT}${ADMIN_TOKEN ? " · admin tools on" : " · no admin token"}`);
   console.log(`  search ${EXA_KEY ? "exa" : TAVILY_KEY ? "tavily" : SEARXNG_URL ? "searxng" : "off"}`);
   if (!API_KEY) console.log("  no FRENIX_API_KEY — calling the endpoint unauthenticated");
+
+  watchGatewayHealth();
 
   let offset = 0;
   for (;;) {
@@ -1383,8 +1456,12 @@ function runSelfTest() {
   return failed === 0;
 }
 
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+function shutdown() {
+  saveState();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 if (process.argv.includes("--selftest")) {
   process.exit(runSelfTest() ? 0 : 1);
