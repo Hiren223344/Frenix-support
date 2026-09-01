@@ -1060,7 +1060,7 @@ setInterval(() => {
   for (const [id, t] of tickets) {
     if (t.status === "closed" && now - (t.closedAt || t.createdAt) > TICKET_RETENTION_MS) {
       tickets.delete(id);
-      cardIndex.delete(t.cardMsgId);
+      for (const v of t.views || []) cardIndex.delete(v.messageId);
     }
   }
   saveState();
@@ -1080,8 +1080,10 @@ function loadState() {
     }
     for (const [id, t] of data.tickets || []) {
       if (!t || typeof t !== "object" || !t.status) continue; // skip pre-ticket-system entries
+      if (!Array.isArray(t.views)) t.views = t.cardMsgId ? [{ chatId: SUPPORT_CHAT, messageId: t.cardMsgId }] : [];
       tickets.set(id, t);
-      if (t.cardMsgId) cardIndex.set(t.cardMsgId, id);
+      for (const v of t.views) cardIndex.set(v.messageId, id);
+      if (t.status !== "closed") chatTickets.set(t.chatId, id);
     }
     if (typeof data.nextTicketId === "number") nextTicketId = Math.max(nextTicketId, data.nextTicketId);
     console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} ticket(s)`);
@@ -1162,13 +1164,19 @@ function buildContent(text, images) {
 /* ================================================================== */
 
 const isAdmin = (msg) => String(msg.from?.id) === String(ADMIN_ID);
-// staff = anyone who can see SUPPORT_CHAT — the trust boundary for claiming/closing tickets
+// staff = the admin anywhere, or anyone posting from inside SUPPORT_CHAT —
+// the trust boundary for claiming/closing tickets and listing/viewing them
 const isStaff = (msg) => isAdmin(msg) || (SUPPORT_CHAT && String(msg.chat.id) === String(SUPPORT_CHAT));
+const isStaffCallback = (cb) => isStaff({ from: cb.from, chat: cb.message?.chat || {} });
 
-// ticket id -> { id, chatId, status, who, note, recent, cardMsgId, claimedBy, closedBy, createdAt, closedAt }
+// ticket id -> { id, chatId, status, who, note, recent, cardMsgId, views, claimedBy, closedBy, createdAt, closedAt }
+// views: every message anywhere that shows this ticket's card (the original + any /tickets detail
+// views) — all of them get edited together so Claim/Close stay in sync wherever it's being looked at.
 const tickets = new Map();
-// message_id of a ticket card in the support chat -> ticket id, for fast lookup on staff replies
+// message_id (of a card, a view, or a relayed user message) -> ticket id, for fast lookup on staff replies
 const cardIndex = new Map();
+// chat id -> the one active (non-closed) ticket for that chat, so follow-up messages know where to go
+const chatTickets = new Map();
 let nextTicketId = 1;
 
 function who(msg) {
@@ -1194,18 +1202,38 @@ function ticketKeyboard(t) {
 }
 
 async function renderTicketCard(t) {
-  await tg("editMessageText", {
+  const text = ticketCardText(t).slice(0, 4000);
+  const reply_markup = ticketKeyboard(t);
+  await Promise.all(
+    t.views.map((v) =>
+      tg("editMessageText", { chat_id: v.chatId, message_id: v.messageId, text, reply_markup }).catch(() => {})
+    )
+  );
+}
+
+// forward a follow-up message from a user with an open ticket straight into that ticket's
+// thread in SUPPORT_CHAT — copyMessage handles text/photo/document/etc. uniformly, so every
+// message gets through, not just the one snapshot taken when the ticket was first opened
+async function relayToTicket(t, msg) {
+  const copied = await tg("copyMessage", {
     chat_id: SUPPORT_CHAT,
-    message_id: t.cardMsgId,
-    text: ticketCardText(t).slice(0, 4000),
-    reply_markup: ticketKeyboard(t),
-  }).catch(() => {});
+    from_chat_id: msg.chat.id,
+    message_id: msg.message_id,
+    reply_to_message_id: t.cardMsgId,
+  }).catch(() => null);
+  if (copied?.message_id) cardIndex.set(copied.message_id, t.id);
 }
 
 async function handoff(msg, note) {
   const chatId = msg.chat.id;
   if (!SUPPORT_CHAT) {
     return sendPlain(chatId, "No one's on the other end of this button yet. Email support@frenix.sh and someone will pick it up.");
+  }
+
+  const existingId = chatTickets.get(chatId);
+  const existing = existingId != null ? tickets.get(existingId) : null;
+  if (existing && existing.status !== "closed") {
+    return sendPlain(chatId, `You've already got an open ticket (#${existing.id}) — a person will get to it. Just send more details and I'll pass them along.`);
   }
 
   const s = state(chatId);
@@ -1227,6 +1255,7 @@ async function handoff(msg, note) {
     note: note || "",
     recent,
     cardMsgId: 0,
+    views: [],
     claimedBy: null,
     closedBy: null,
     createdAt: Date.now(),
@@ -1241,11 +1270,13 @@ async function handoff(msg, note) {
   if (!card_msg) return sendPlain(chatId, "Couldn't reach the team just now. Email support@frenix.sh.");
 
   t.cardMsgId = card_msg.message_id;
+  t.views = [{ chatId: SUPPORT_CHAT, messageId: card_msg.message_id }];
   tickets.set(t.id, t);
   cardIndex.set(t.cardMsgId, t.id);
+  chatTickets.set(chatId, t.id);
   s.humanUntil = Date.now() + HUMAN_MS;
   saveState();
-  return sendPlain(chatId, `Passed to a person (ticket #${t.id}). I'll stay out of the way until they've replied — /bot brings me back.`);
+  return sendPlain(chatId, `Passed to a person (ticket #${t.id}). I'll stay out of the way until they've replied — /bot brings me back, and anything more you send meanwhile still gets through to them.`);
 }
 
 /* Messages arriving in the support chat: staff replies, not questions for the AI. */
@@ -1263,6 +1294,7 @@ async function staff(msg) {
     t.closedBy = who(msg);
     t.closedAt = Date.now();
     state(target).humanUntil = 0;
+    chatTickets.delete(target);
     await sendPlain(target, "Handoff closed — I'm back if you need anything else.");
     await renderTicketCard(t);
     saveState();
@@ -1283,20 +1315,33 @@ const ack = (id, text, alert) => tg("answerCallbackQuery", { callback_query_id: 
 
 /* Taps on a ticket card's Claim/Close button, or a ticket's row in /tickets. */
 async function routeCallback(cb) {
-  const m = (cb.data || "").match(/^ticket:(claim|close|info):(\d+)$/);
+  const m = (cb.data || "").match(/^ticket:(claim|close|view):(\d+)$/);
   if (!m) return ack(cb.id);
 
   const [, action, idStr] = m;
   const t = tickets.get(Number(idStr));
   if (!t) return ack(cb.id, "That ticket is gone.", true);
 
-  // only people who can see SUPPORT_CHAT get to act on tickets
-  if (!(SUPPORT_CHAT && String(cb.message?.chat?.id) === String(SUPPORT_CHAT))) return ack(cb.id, "Not available here.", true);
+  // only staff — the admin anywhere, or anyone posting from SUPPORT_CHAT — can act on tickets
+  if (!isStaffCallback(cb)) return ack(cb.id, "Not available here.", true);
 
   const actor = who({ from: cb.from });
 
-  if (action === "info") {
-    return ack(cb.id, ticketCardText(t).slice(0, 200), true);
+  if (action === "view") {
+    // send a full, live card here too (not just a truncated toast) so whoever tapped it from
+    // /tickets can read the whole problem and act on it (Claim/Close) without hunting for the
+    // original card in SUPPORT_CHAT — this view stays in sync with every other view via renderTicketCard
+    const sent = await tg("sendMessage", {
+      chat_id: cb.message.chat.id,
+      text: ticketCardText(t).slice(0, 4000),
+      reply_markup: ticketKeyboard(t),
+    });
+    if (sent?.message_id) {
+      t.views.push({ chatId: cb.message.chat.id, messageId: sent.message_id });
+      cardIndex.set(sent.message_id, t.id);
+      saveState();
+    }
+    return ack(cb.id);
   }
 
   if (action === "claim") {
@@ -1314,6 +1359,7 @@ async function routeCallback(cb) {
     t.closedBy = actor;
     t.closedAt = Date.now();
     state(t.chatId).humanUntil = 0;
+    chatTickets.delete(t.chatId);
     await sendPlain(t.chatId, "Handoff closed — I'm back if you need anything else.").catch(() => {});
     await renderTicketCard(t);
     saveState();
@@ -1369,17 +1415,27 @@ async function handle(msg, extraImages = []) {
     if (!open.length) return sendPlain(chatId, "No open tickets.");
     const keyboard = open.slice(0, 30).map((t) => [{
       text: `#${t.id} · ${t.status} · ${t.who.split(" (")[0].slice(0, 24)}`,
-      callback_data: `ticket:info:${t.id}`,
+      callback_data: `ticket:view:${t.id}`,
     }]);
     return tg("sendMessage", {
       chat_id: chatId,
-      text: `Open tickets (${open.length}) — tap one for a quick look:`,
+      text: `Open tickets (${open.length}) — tap one to see the full problem and act on it:`,
       reply_markup: { inline_keyboard: keyboard },
     });
   }
 
-  // a person is on this thread — don't talk over them
-  if (s.humanUntil > Date.now()) return;
+  // a person is on this thread — don't talk over them, but don't drop what they're saying either:
+  // forward every follow-up straight into their ticket's thread so staff sees the whole
+  // conversation, not just the one snapshot taken when /human was first called
+  if (s.humanUntil > Date.now()) {
+    const activeId = chatTickets.get(chatId);
+    const active = activeId != null ? tickets.get(activeId) : null;
+    if (active && active.status !== "closed") {
+      await relayToTicket(active, msg);
+      s.humanUntil = Date.now() + HUMAN_MS; // fresh activity keeps the quiet window (and the bot) out of the way
+    }
+    return;
+  }
 
   const { text, images } = await collect(msg);
   const allImages = [...images, ...extraImages];
