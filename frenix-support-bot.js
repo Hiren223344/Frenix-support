@@ -410,6 +410,33 @@ async function adminGet(path) {
    one with an image. Nothing here is inferred from a model name. */
 const probeCache = new Map();
 
+/* Passive uptime tracking: every real (non-cached) probeModel() run — from
+   test_model or /ping — records a pass/fail here. No extra requests of our
+   own, so coverage only builds for models people actually ask about, but it
+   costs nothing beyond what test_model was already doing. */
+const modelUptime = new Map(); // model id -> { checks, ok, lastAt, lastUp }
+
+function recordModelCheck(id, up) {
+  const u = modelUptime.get(id) || { checks: 0, ok: 0, lastAt: 0, lastUp: null };
+  u.checks++;
+  if (up) u.ok++;
+  u.lastAt = Date.now();
+  u.lastUp = up;
+  modelUptime.set(id, u);
+}
+
+function modelUptimeStats(id) {
+  const u = modelUptime.get(id);
+  if (!u) return null;
+  return {
+    model: id,
+    checks_recorded: u.checks,
+    uptime_pct: +((u.ok / u.checks) * 100).toFixed(1),
+    last_checked: new Date(u.lastAt).toISOString(),
+    last_status: u.lastUp ? "up" : "down",
+  };
+}
+
 const PROBE_TOOL = {
   type: "function",
   function: {
@@ -546,6 +573,7 @@ async function probeModel(id, { full = true } = {}) {
   } catch (e) {
     result = { model: id, up: false, error: e.name === "TimeoutError" ? "no response in 30s" : e.message };
   }
+  recordModelCheck(id, !!result.up);
   probeCache.set(key, { at: Date.now(), result });
   return result;
 }
@@ -676,19 +704,30 @@ async function runTool(name, argsJson, isAdmin) {
           near: known.filter((m) => m.toLowerCase().includes(id.toLowerCase().split(/[-_/]/)[0] || "")).slice(0, 10),
         });
       }
+
+      const tracked = modelUptimeStats(id); // our own passively-recorded uptime from past test_model/ /ping checks
+
       if (!STATUS_URL) {
-        return JSON.stringify({
-          model: id,
-          exists: true,
-          health: "no feed configured",
-          note: "Use test_model for a live check instead.",
-        });
+        return JSON.stringify(
+          tracked
+            ? { model: id, exists: true, source: "tracked (from past live checks)", ...tracked }
+            : {
+                model: id,
+                exists: true,
+                health: "no checks recorded yet",
+                note: "No feed is configured and nobody's called test_model on this model yet. Call test_model to check it live — that also starts tracking its uptime here.",
+              }
+        );
       }
       const res = await fetch(STATUS_URL, { headers: auth() });
-      if (!res.ok) return JSON.stringify({ model: id, health: "unavailable", status: res.status });
+      if (!res.ok) return JSON.stringify({ model: id, health: "unavailable", status: res.status, tracked });
       const body = await res.json();
       const rows = Array.isArray(body) ? body : body?.data || [];
-      return JSON.stringify({ model: id, health: rows.find((r) => (r.id || r.model || r.name) === id) || "not on the feed" });
+      return JSON.stringify({
+        model: id,
+        health: rows.find((r) => (r.id || r.model || r.name) === id) || "not on the feed",
+        tracked,
+      });
     }
 
     if (name === "web_search") return JSON.stringify(await webSearch(args.query || ""));
