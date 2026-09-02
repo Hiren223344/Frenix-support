@@ -1054,6 +1054,8 @@ function state(id) {
 }
 
 const TICKET_RETENTION_MS = 7 * 24 * 60 * 60e3; // how long a closed ticket stays around after closing
+const ESCALATION_MS = 15 * 60e3; // nudge SUPPORT_CHAT again if a ticket sits unclaimed this long
+                                  // (checked on the 10-min tick below, so actual delay is 15-25 min)
 
 setInterval(() => {
   const now = Date.now();
@@ -1062,6 +1064,13 @@ setInterval(() => {
     if (t.status === "closed" && now - (t.closedAt || t.createdAt) > TICKET_RETENTION_MS) {
       tickets.delete(id);
       for (const v of t.views || []) cardIndex.delete(v.messageId);
+    } else if (t.status === "open" && !t.escalated && now - t.createdAt > ESCALATION_MS) {
+      t.escalated = true;
+      tg("sendMessage", {
+        chat_id: SUPPORT_CHAT,
+        text: `Ticket #${t.id} is still unclaimed after ${Math.round((now - t.createdAt) / 60e3)} min.`,
+        reply_to_message_id: t.cardMsgId,
+      }).catch(() => {});
     }
   }
   saveState();
@@ -1299,7 +1308,9 @@ async function handoff(msg, note) {
     claimedBy: null,
     closedBy: null,
     createdAt: Date.now(),
+    claimedAt: 0,
     closedAt: 0,
+    escalated: false,
     transcript: [],
   };
   if (note) logTicket(t, "user", note);
@@ -1394,6 +1405,7 @@ async function routeCallback(cb) {
     if (t.status !== "open") return ack(cb.id, `Already ${t.status}.`, true);
     t.status = "claimed";
     t.claimedBy = actor;
+    t.claimedAt = Date.now();
     await renderTicketCard(t);
     saveState();
     return ack(cb.id, "Claimed.");
@@ -1469,6 +1481,32 @@ async function handle(msg, extraImages = []) {
       text: `Open tickets (${open.length}) — tap one to see the full problem and act on it:`,
       reply_markup: { inline_keyboard: keyboard },
     });
+  }
+  if (/^\/stats\b/.test(raw)) {
+    if (!isStaff(msg)) return;
+    const all = [...tickets.values()];
+    const now = Date.now();
+    const within24h = (t, field) => t[field] && now - t[field] < 24 * 60 * 60e3;
+    const avgMin = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length / 60e3) : null);
+    const avgClaim = avgMin(all.filter((t) => t.claimedAt).map((t) => t.claimedAt - t.createdAt));
+    const avgClose = avgMin(all.filter((t) => t.status === "closed").map((t) => t.closedAt - t.createdAt));
+    const lines = [
+      `Tickets tracked: ${all.length} (${all.filter((t) => t.status !== "closed").length} currently open)`,
+      `Opened in last 24h: ${all.filter((t) => within24h(t, "createdAt")).length}`,
+      `Closed in last 24h: ${all.filter((t) => t.status === "closed" && within24h(t, "closedAt")).length}`,
+      `Avg time to claim: ${avgClaim != null ? avgClaim + " min" : "no data yet"}`,
+      `Avg time to close: ${avgClose != null ? avgClose + " min" : "no data yet"}`,
+    ];
+    return sendPlain(chatId, lines.join("\n"));
+  }
+  if (/^\/uptime\b/.test(raw)) {
+    if (!isStaff(msg)) return;
+    if (!modelUptime.size) return sendPlain(chatId, "No models have been checked yet — /ping one to start tracking.");
+    const rows = [...modelUptime.entries()]
+      .map(([id, u]) => ({ id, pct: (u.ok / u.checks) * 100, checks: u.checks, lastUp: u.lastUp }))
+      .sort((a, b) => a.pct - b.pct); // worst first, so the models worth worrying about surface immediately
+    const lines = rows.map((r) => `${r.lastUp ? "up  " : "down"} ${r.pct.toFixed(0)}% (${r.checks}x checked) — ${r.id}`);
+    return sendHtml(chatId, toHtml("```\n" + lines.join("\n") + "\n```"));
   }
 
   // a person is on this thread — don't talk over them, but don't drop what they're saying either:
@@ -1602,6 +1640,21 @@ async function main() {
 
   const me = await tg("getMe", {});
   if (!me) { console.error("Bad TELEGRAM_TOKEN."); process.exit(1); }
+
+  // keep Telegram's own command menu in sync with what the bot actually supports,
+  // instead of that drifting out of date in BotFather's separate /setcommands config.
+  // /tickets isn't listed here — it's staff-only and this menu is visible to every user.
+  await tg("setMyCommands", {
+    commands: [
+      { command: "start", description: "Welcome message and what I can help with" },
+      { command: "new", description: "Clear this thread and start fresh" },
+      { command: "human", description: "Hand this conversation to a person" },
+      { command: "ping", description: "Check if a model is up, how fast, and what it supports" },
+      { command: "diag", description: "Check the gateway's health from my side" },
+      { command: "bot", description: "Bring me back after a human handoff" },
+    ],
+  }).catch((e) => console.error("setMyCommands:", e.message));
+
   console.log(`Frenix Support up as @${me.username}`);
   console.log(`  gateway (internal) ${API_BASE}`);
   console.log(`  gateway (public, told to users) ${PUBLIC_BASE}`);
