@@ -1041,12 +1041,58 @@ function watchGatewayHealth() {
 }
 
 /* ================================================================== */
+/* weekly feedback                                                    */
+/* ================================================================== */
+
+const FEEDBACK_INTERVAL_MS = 7 * 24 * 60 * 60e3; // how often to ask every known chat for feedback
+let lastFeedbackAt = Date.now(); // starts the clock at deploy time so a fresh deploy doesn't
+                                  // immediately blast everyone; loadState() restores the real value
+
+const FEEDBACK_FILE = new URL("./feedback.log", import.meta.url);
+
+function recordFeedback(chatId, rating) {
+  try {
+    appendFileSync(FEEDBACK_FILE, `${new Date().toISOString()}\t${chatId}\t${rating}\n`);
+  } catch (e) {
+    console.error("feedback save:", e.message);
+  }
+}
+
+async function sendWeeklyFeedback() {
+  lastFeedbackAt = Date.now();
+  saveState();
+  const keyboard = {
+    inline_keyboard: [[1, 2, 3, 4, 5].map((n) => ({ text: "★".repeat(n), callback_data: `feedback:${n}` }))],
+  };
+  for (const chatId of knownChats) {
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: "Quick one — how's Frenix been for you this week? Tap a rating, or just reply with anything.",
+      reply_markup: keyboard,
+    }).catch(() => {}); // one blocked/deleted chat shouldn't stop the broadcast
+  }
+}
+
+function watchWeeklyFeedback() {
+  setInterval(() => {
+    if (Date.now() - lastFeedbackAt > FEEDBACK_INTERVAL_MS) {
+      sendWeeklyFeedback().catch((e) => console.error("weekly feedback:", e.message));
+    }
+  }, 6 * 60 * 60e3).unref(); // check a few times a day — the 7-day gate above controls the actual send
+}
+
+/* ================================================================== */
 /* per-chat state                                                     */
 /* ================================================================== */
 
 const chats = new Map();
+// every chat id that has ever messaged the bot — unlike `chats`, this is never pruned by
+// IDLE_MS, so the weekly feedback broadcast can still reach someone who hasn't talked to the
+// bot in months
+const knownChats = new Set();
 
 function state(id) {
+  knownChats.add(id);
   let s = chats.get(id);
   if (!s) chats.set(id, (s = { history: [], busy: false, seen: 0, humanUntil: 0 }));
   s.seen = Date.now();
@@ -1096,7 +1142,9 @@ function loadState() {
       if (t.status !== "closed") chatTickets.set(t.chatId, id);
     }
     if (typeof data.nextTicketId === "number") nextTicketId = Math.max(nextTicketId, data.nextTicketId);
-    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} ticket(s)`);
+    for (const id of data.knownChats || []) knownChats.add(id);
+    if (typeof data.lastFeedbackAt === "number") lastFeedbackAt = data.lastFeedbackAt;
+    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} ticket(s), ${knownChats.size} known chat(s)`);
   } catch {} // no state.json yet, or it's unreadable — start fresh
 }
 
@@ -1104,7 +1152,13 @@ function saveState() {
   try {
     writeFileSync(
       STATE_FILE,
-      JSON.stringify({ chats: [...chats.entries()], tickets: [...tickets.entries()], nextTicketId })
+      JSON.stringify({
+        chats: [...chats.entries()],
+        tickets: [...tickets.entries()],
+        nextTicketId,
+        knownChats: [...knownChats],
+        lastFeedbackAt,
+      })
     );
   } catch (e) {
     console.error("saveState:", e.message);
@@ -1372,6 +1426,19 @@ const ack = (id, text, alert) => tg("answerCallbackQuery", { callback_query_id: 
 
 /* Taps on a ticket card's Claim/Close button, or a ticket's row in /tickets. */
 async function routeCallback(cb) {
+  const fm = (cb.data || "").match(/^feedback:([1-5])$/);
+  if (fm) {
+    recordFeedback(cb.message?.chat?.id ?? cb.from.id, Number(fm[1]));
+    if (cb.message) {
+      await tg("editMessageReplyMarkup", {
+        chat_id: cb.message.chat.id,
+        message_id: cb.message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      }).catch(() => {});
+    }
+    return ack(cb.id, "Thanks for the feedback!");
+  }
+
   const m = (cb.data || "").match(/^ticket:(claim|close|view):(\d+)$/);
   if (!m) return ack(cb.id);
 
@@ -1507,6 +1574,24 @@ async function handle(msg, extraImages = []) {
       .sort((a, b) => a.pct - b.pct); // worst first, so the models worth worrying about surface immediately
     const lines = rows.map((r) => `${r.lastUp ? "up  " : "down"} ${r.pct.toFixed(0)}% (${r.checks}x checked) — ${r.id}`);
     return sendHtml(chatId, toHtml("```\n" + lines.join("\n") + "\n```"));
+  }
+  if (/^\/feedbackstats\b/.test(raw)) {
+    if (!isStaff(msg)) return;
+    let rows = [];
+    try {
+      rows = readFileSync(FEEDBACK_FILE, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const [at, , rating] = line.split("\t");
+          return { at: new Date(at).getTime(), rating: Number(rating) };
+        });
+    } catch {} // no feedback.log yet
+    if (!rows.length) return sendPlain(chatId, "No feedback recorded yet.");
+    const recent = rows.filter((r) => Date.now() - r.at < 7 * 24 * 60 * 60e3);
+    const avg = (arr) => (arr.length ? (arr.reduce((a, b) => a + b.rating, 0) / arr.length).toFixed(1) : "n/a");
+    return sendPlain(chatId, `Feedback: ${rows.length} total, avg ${avg(rows)}★\nLast 7 days: ${recent.length} response(s), avg ${avg(recent)}★`);
   }
 
   // a person is on this thread — don't talk over them, but don't drop what they're saying either:
@@ -1664,6 +1749,7 @@ async function main() {
   if (!API_KEY) console.log("  no FRENIX_API_KEY — calling the endpoint unauthenticated");
 
   watchGatewayHealth();
+  watchWeeklyFeedback();
 
   let offset = 0;
   for (;;) {
