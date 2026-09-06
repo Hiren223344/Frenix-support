@@ -1041,12 +1041,58 @@ function watchGatewayHealth() {
 }
 
 /* ================================================================== */
+/* weekly feedback                                                    */
+/* ================================================================== */
+
+const FEEDBACK_INTERVAL_MS = 7 * 24 * 60 * 60e3; // how often to ask every known chat for feedback
+let lastFeedbackAt = Date.now(); // starts the clock at deploy time so a fresh deploy doesn't
+                                  // immediately blast everyone; loadState() restores the real value
+
+const FEEDBACK_FILE = new URL("./feedback.log", import.meta.url);
+
+function recordFeedback(chatId, rating) {
+  try {
+    appendFileSync(FEEDBACK_FILE, `${new Date().toISOString()}\t${chatId}\t${rating}\n`);
+  } catch (e) {
+    console.error("feedback save:", e.message);
+  }
+}
+
+async function sendWeeklyFeedback() {
+  lastFeedbackAt = Date.now();
+  saveState();
+  const keyboard = {
+    inline_keyboard: [[1, 2, 3, 4, 5].map((n) => ({ text: "★".repeat(n), callback_data: `feedback:${n}` }))],
+  };
+  for (const chatId of knownChats) {
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: "Quick one — how's Frenix been for you this week? Tap a rating, or just reply with anything.",
+      reply_markup: keyboard,
+    }).catch(() => {}); // one blocked/deleted chat shouldn't stop the broadcast
+  }
+}
+
+function watchWeeklyFeedback() {
+  setInterval(() => {
+    if (Date.now() - lastFeedbackAt > FEEDBACK_INTERVAL_MS) {
+      sendWeeklyFeedback().catch((e) => console.error("weekly feedback:", e.message));
+    }
+  }, 6 * 60 * 60e3).unref(); // check a few times a day — the 7-day gate above controls the actual send
+}
+
+/* ================================================================== */
 /* per-chat state                                                     */
 /* ================================================================== */
 
 const chats = new Map();
+// every chat id that has ever messaged the bot — unlike `chats`, this is never pruned by
+// IDLE_MS, so the weekly feedback broadcast can still reach someone who hasn't talked to the
+// bot in months
+const knownChats = new Set();
 
 function state(id) {
+  knownChats.add(id);
   let s = chats.get(id);
   if (!s) chats.set(id, (s = { history: [], busy: false, seen: 0, humanUntil: 0 }));
   s.seen = Date.now();
@@ -1054,6 +1100,8 @@ function state(id) {
 }
 
 const TICKET_RETENTION_MS = 7 * 24 * 60 * 60e3; // how long a closed ticket stays around after closing
+const ESCALATION_MS = 15 * 60e3; // nudge SUPPORT_CHAT again if a ticket sits unclaimed this long
+                                  // (checked on the 10-min tick below, so actual delay is 15-25 min)
 
 setInterval(() => {
   const now = Date.now();
@@ -1062,6 +1110,13 @@ setInterval(() => {
     if (t.status === "closed" && now - (t.closedAt || t.createdAt) > TICKET_RETENTION_MS) {
       tickets.delete(id);
       for (const v of t.views || []) cardIndex.delete(v.messageId);
+    } else if (t.status === "open" && !t.escalated && now - t.createdAt > ESCALATION_MS) {
+      t.escalated = true;
+      tg("sendMessage", {
+        chat_id: SUPPORT_CHAT,
+        text: `Ticket #${t.id} is still unclaimed after ${Math.round((now - t.createdAt) / 60e3)} min.`,
+        reply_to_message_id: t.cardMsgId,
+      }).catch(() => {});
     }
   }
   saveState();
@@ -1087,7 +1142,9 @@ function loadState() {
       if (t.status !== "closed") chatTickets.set(t.chatId, id);
     }
     if (typeof data.nextTicketId === "number") nextTicketId = Math.max(nextTicketId, data.nextTicketId);
-    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} ticket(s)`);
+    for (const id of data.knownChats || []) knownChats.add(id);
+    if (typeof data.lastFeedbackAt === "number") lastFeedbackAt = data.lastFeedbackAt;
+    console.log(`  state restored: ${chats.size} chat(s), ${tickets.size} ticket(s), ${knownChats.size} known chat(s)`);
   } catch {} // no state.json yet, or it's unreadable — start fresh
 }
 
@@ -1095,7 +1152,13 @@ function saveState() {
   try {
     writeFileSync(
       STATE_FILE,
-      JSON.stringify({ chats: [...chats.entries()], tickets: [...tickets.entries()], nextTicketId })
+      JSON.stringify({
+        chats: [...chats.entries()],
+        tickets: [...tickets.entries()],
+        nextTicketId,
+        knownChats: [...knownChats],
+        lastFeedbackAt,
+      })
     );
   } catch (e) {
     console.error("saveState:", e.message);
@@ -1299,7 +1362,9 @@ async function handoff(msg, note) {
     claimedBy: null,
     closedBy: null,
     createdAt: Date.now(),
+    claimedAt: 0,
     closedAt: 0,
+    escalated: false,
     transcript: [],
   };
   if (note) logTicket(t, "user", note);
@@ -1361,6 +1426,19 @@ const ack = (id, text, alert) => tg("answerCallbackQuery", { callback_query_id: 
 
 /* Taps on a ticket card's Claim/Close button, or a ticket's row in /tickets. */
 async function routeCallback(cb) {
+  const fm = (cb.data || "").match(/^feedback:([1-5])$/);
+  if (fm) {
+    recordFeedback(cb.message?.chat?.id ?? cb.from.id, Number(fm[1]));
+    if (cb.message) {
+      await tg("editMessageReplyMarkup", {
+        chat_id: cb.message.chat.id,
+        message_id: cb.message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      }).catch(() => {});
+    }
+    return ack(cb.id, "Thanks for the feedback!");
+  }
+
   const m = (cb.data || "").match(/^ticket:(claim|close|view):(\d+)$/);
   if (!m) return ack(cb.id);
 
@@ -1394,6 +1472,7 @@ async function routeCallback(cb) {
     if (t.status !== "open") return ack(cb.id, `Already ${t.status}.`, true);
     t.status = "claimed";
     t.claimedBy = actor;
+    t.claimedAt = Date.now();
     await renderTicketCard(t);
     saveState();
     return ack(cb.id, "Claimed.");
@@ -1469,6 +1548,50 @@ async function handle(msg, extraImages = []) {
       text: `Open tickets (${open.length}) — tap one to see the full problem and act on it:`,
       reply_markup: { inline_keyboard: keyboard },
     });
+  }
+  if (/^\/stats\b/.test(raw)) {
+    if (!isStaff(msg)) return;
+    const all = [...tickets.values()];
+    const now = Date.now();
+    const within24h = (t, field) => t[field] && now - t[field] < 24 * 60 * 60e3;
+    const avgMin = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length / 60e3) : null);
+    const avgClaim = avgMin(all.filter((t) => t.claimedAt).map((t) => t.claimedAt - t.createdAt));
+    const avgClose = avgMin(all.filter((t) => t.status === "closed").map((t) => t.closedAt - t.createdAt));
+    const lines = [
+      `Tickets tracked: ${all.length} (${all.filter((t) => t.status !== "closed").length} currently open)`,
+      `Opened in last 24h: ${all.filter((t) => within24h(t, "createdAt")).length}`,
+      `Closed in last 24h: ${all.filter((t) => t.status === "closed" && within24h(t, "closedAt")).length}`,
+      `Avg time to claim: ${avgClaim != null ? avgClaim + " min" : "no data yet"}`,
+      `Avg time to close: ${avgClose != null ? avgClose + " min" : "no data yet"}`,
+    ];
+    return sendPlain(chatId, lines.join("\n"));
+  }
+  if (/^\/uptime\b/.test(raw)) {
+    if (!isStaff(msg)) return;
+    if (!modelUptime.size) return sendPlain(chatId, "No models have been checked yet — /ping one to start tracking.");
+    const rows = [...modelUptime.entries()]
+      .map(([id, u]) => ({ id, pct: (u.ok / u.checks) * 100, checks: u.checks, lastUp: u.lastUp }))
+      .sort((a, b) => a.pct - b.pct); // worst first, so the models worth worrying about surface immediately
+    const lines = rows.map((r) => `${r.lastUp ? "up  " : "down"} ${r.pct.toFixed(0)}% (${r.checks}x checked) — ${r.id}`);
+    return sendHtml(chatId, toHtml("```\n" + lines.join("\n") + "\n```"));
+  }
+  if (/^\/feedbackstats\b/.test(raw)) {
+    if (!isStaff(msg)) return;
+    let rows = [];
+    try {
+      rows = readFileSync(FEEDBACK_FILE, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const [at, , rating] = line.split("\t");
+          return { at: new Date(at).getTime(), rating: Number(rating) };
+        });
+    } catch {} // no feedback.log yet
+    if (!rows.length) return sendPlain(chatId, "No feedback recorded yet.");
+    const recent = rows.filter((r) => Date.now() - r.at < 7 * 24 * 60 * 60e3);
+    const avg = (arr) => (arr.length ? (arr.reduce((a, b) => a + b.rating, 0) / arr.length).toFixed(1) : "n/a");
+    return sendPlain(chatId, `Feedback: ${rows.length} total, avg ${avg(rows)}★\nLast 7 days: ${recent.length} response(s), avg ${avg(recent)}★`);
   }
 
   // a person is on this thread — don't talk over them, but don't drop what they're saying either:
@@ -1602,6 +1725,21 @@ async function main() {
 
   const me = await tg("getMe", {});
   if (!me) { console.error("Bad TELEGRAM_TOKEN."); process.exit(1); }
+
+  // keep Telegram's own command menu in sync with what the bot actually supports,
+  // instead of that drifting out of date in BotFather's separate /setcommands config.
+  // /tickets isn't listed here — it's staff-only and this menu is visible to every user.
+  await tg("setMyCommands", {
+    commands: [
+      { command: "start", description: "Welcome message and what I can help with" },
+      { command: "new", description: "Clear this thread and start fresh" },
+      { command: "human", description: "Hand this conversation to a person" },
+      { command: "ping", description: "Check if a model is up, how fast, and what it supports" },
+      { command: "diag", description: "Check the gateway's health from my side" },
+      { command: "bot", description: "Bring me back after a human handoff" },
+    ],
+  }).catch((e) => console.error("setMyCommands:", e.message));
+
   console.log(`Frenix Support up as @${me.username}`);
   console.log(`  gateway (internal) ${API_BASE}`);
   console.log(`  gateway (public, told to users) ${PUBLIC_BASE}`);
@@ -1611,6 +1749,7 @@ async function main() {
   if (!API_KEY) console.log("  no FRENIX_API_KEY — calling the endpoint unauthenticated");
 
   watchGatewayHealth();
+  watchWeeklyFeedback();
 
   let offset = 0;
   for (;;) {
