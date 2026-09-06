@@ -1273,7 +1273,12 @@ async function isChannelMember(telegramId) {
 }
 
 function joinChannelKeyboard() {
-  return { inline_keyboard: [[{ text: `Join ${REQUIRED_CHANNEL || "the channel"}`, url: REQUIRED_CHANNEL_URL }]] };
+  return {
+    inline_keyboard: [
+      [{ text: `Join ${REQUIRED_CHANNEL || "the channel"}`, url: REQUIRED_CHANNEL_URL }],
+      [{ text: "I've joined", callback_data: "channel:recheck" }],
+    ],
+  };
 }
 
 /* Reports a verified Telegram identity back to the web backend for the /start <token> deep-link
@@ -1511,8 +1516,29 @@ async function staff(msg) {
 
 const ack = (id, text, alert) => tg("answerCallbackQuery", { callback_query_id: id, text, show_alert: !!alert }).catch(() => {});
 
+/* "I've joined" button on the join-channel prompt — re-checks membership right away instead of
+   making the user send a throwaway message just to trigger the gate again. */
+async function recheckChannelMembership(cb) {
+  const membership = await isChannelMember(cb.from.id);
+
+  if (membership.ok === null) return ack(cb.id, "Couldn't verify right now — try again in a moment.", true);
+  if (membership.ok === false) return ack(cb.id, `Still not seeing you in ${REQUIRED_CHANNEL} — join first, then tap this again.`, true);
+
+  if (cb.message) {
+    await tg("editMessageText", {
+      chat_id: cb.message.chat.id,
+      message_id: cb.message.message_id,
+      text: "You're in! Send your message again.",
+      reply_markup: { inline_keyboard: [] }, // omitting this would leave the old buttons in place
+    }).catch(() => {});
+  }
+  return ack(cb.id, "Verified!");
+}
+
 /* Taps on a ticket card's Claim/Close button, or a ticket's row in /tickets. */
 async function routeCallback(cb) {
+  if (cb.data === "channel:recheck") return recheckChannelMembership(cb);
+
   const fm = (cb.data || "").match(/^feedback:([1-5])$/);
   if (fm) {
     recordFeedback(cb.message?.chat?.id ?? cb.from.id, Number(fm[1]));
