@@ -16,11 +16,13 @@
  * Optional: FRENIX_BASE_URL, FRENIX_MODEL, BOT_USERNAME, ADMIN_ID, SUPPORT_CHAT_ID,
  *           FRENIX_ADMIN_TOKEN, FRENIX_ADMIN_BASE, FRENIX_ADMIN_USER_ID,
  *           TAVILY_API_KEY or SEARXNG_URL, FRENIX_STATUS_URL,
- *           FRENIX_REQUIRED_CHANNEL, FRENIX_REQUIRED_CHANNEL_URL
+ *           FRENIX_REQUIRED_CHANNEL, FRENIX_REQUIRED_CHANNEL_URL,
+ *           FRENIX_AUTH_CALLBACK_URL, FRENIX_AUTH_CALLBACK_SECRET
  * ------------------------------------------------------------------
  */
 
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
 
 /* ================================================================== */
 /* config                                                             */
@@ -83,6 +85,13 @@ const STATUS_URL = process.env.FRENIX_STATUS_URL || "";
 // must be an admin of the channel either way, or getChatMember returns an error for everyone.
 const REQUIRED_CHANNEL = process.env.FRENIX_REQUIRED_CHANNEL || "";
 const REQUIRED_CHANNEL_URL = process.env.FRENIX_REQUIRED_CHANNEL_URL || "https://t.me/frenixapi";
+
+// website login handshake: /start <token> reports the verified Telegram identity back to the
+// web backend that minted the token. Empty AUTH_CALLBACK_URL = feature disabled (bare /start
+// just shows WELCOME as before). The shared secret lets the backend trust this report actually
+// came from this bot, not a spoofed request.
+const AUTH_CALLBACK_URL = process.env.FRENIX_AUTH_CALLBACK_URL || "";
+const AUTH_CALLBACK_SECRET = process.env.FRENIX_AUTH_CALLBACK_SECRET || "";
 
 const MAX_TURNS  = 12;              // messages kept per chat
 const IDLE_MS    = 2 * 60 * 60e3;   // forget a chat after 2h quiet
@@ -1204,6 +1213,40 @@ function joinChannelKeyboard() {
   return { inline_keyboard: [[{ text: `Join ${REQUIRED_CHANNEL || "the channel"}`, url: REQUIRED_CHANNEL_URL }]] };
 }
 
+/* Reports a verified Telegram identity back to the web backend for the /start <token> deep-link
+   login handshake. By the time this runs, the channel gate above has already required — and
+   confirmed — membership, so the backend never has to re-check it itself for this flow. */
+async function completeWebLogin(msg, token) {
+  const chatId = msg.chat.id;
+  if (!AUTH_CALLBACK_URL) return sendPlain(chatId, WELCOME); // feature not configured
+
+  const body = JSON.stringify({
+    token,
+    telegram_id: msg.from.id,
+    username: msg.from.username || null,
+    first_name: msg.from.first_name || null,
+  });
+  const signature = createHmac("sha256", AUTH_CALLBACK_SECRET).update(body).digest("hex");
+
+  try {
+    const res = await fetch(AUTH_CALLBACK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Frenix-Signature": signature },
+      body,
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      console.error(`completeWebLogin: backend returned ${res.status} for token ${token.slice(0, 8)}...`);
+      return sendPlain(chatId, "Something went wrong confirming your sign-in — go back to the website and try again.");
+    }
+  } catch (e) {
+    console.error(`completeWebLogin: callback failed: ${e.message}`);
+    return sendPlain(chatId, "Something went wrong confirming your sign-in — go back to the website and try again.");
+  }
+
+  return sendPlain(chatId, "You're signed in! Head back to frenix.sh to continue.");
+}
+
 /* ================================================================== */
 /* human handoff                                                      */
 /* ================================================================== */
@@ -1491,6 +1534,8 @@ async function handle(msg, extraImages = []) {
 
   const s = state(chatId);
 
+  const startToken = raw.match(/^\/start(?:@\S+)?\s+(\S+)/)?.[1];
+  if (startToken) { s.history = []; return completeWebLogin(msg, startToken); }
   if (/^\/(start|help)\b/.test(raw)) { s.history = []; return sendPlain(chatId, WELCOME); }
   if (/^\/(new|reset|clear)\b/.test(raw)) { s.history = []; return sendPlain(chatId, "Thread cleared. What's breaking?"); }
   if (/^\/human\b/.test(raw)) return handoff(msg, raw.replace(/^\/human\s*/i, "").trim());
